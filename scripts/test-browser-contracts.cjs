@@ -498,7 +498,11 @@ async function waitForHydrated(page) {
         [...document.querySelectorAll(`${SIDEBAR_NAV} a[role="button"]`)].some(
           (link) => link.getAttribute("href") === "#",
         ),
-      { timeout: 5000 },
+      // Interval, not the default 'raf': rAF is frame-bound and can pause under
+      // renderer throttling; this probe is the one whose timeout selects the
+      // network-idle fallback, so it's worth being immune to that. 100ms sits well
+      // inside the 5s budget.
+      { timeout: 5000, polling: 100 },
     )
     .then(() => true)
     .catch(() => false);

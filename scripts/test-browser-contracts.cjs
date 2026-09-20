@@ -118,11 +118,40 @@ async function emulateReducedMotion(page) {
   ]);
 }
 
+// The built site ships third-party requests the contracts don't depend on (umami
+// analytics, the homepage's live api.github.com star refresh, remote doc images). One
+// that stalls without ever receiving response headers keeps Puppeteer's inflight
+// counter above zero, so waitForNetworkIdle() could only time out. Abort every
+// non-local request so the wait observes only the local static server, whose
+// responses always arrive.
+async function blockForeignRequests(page) {
+  await page.setRequestInterception(true);
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    const foreignHttp =
+      url.protocol.startsWith("http") &&
+      url.hostname !== "127.0.0.1" &&
+      url.hostname !== "localhost";
+    const resolution = foreignHttp ? request.abort() : request.continue();
+    resolution.catch((error) =>
+      console.warn(`[hermetic] ${request.url()}: ${error.message}`),
+    );
+  });
+}
+
+// Hermetic by construction: every contract page gets interception before its first
+// navigation, so a new inspector cannot forget the block.
+async function openContractPage() {
+  const page = await browser.newPage();
+  await blockForeignRequests(page);
+  return page;
+}
+
 // Every inspector runs the same scaffold: a fresh page at one viewport, a
 // failure screenshot named after the inspector, and a close that must never
 // mask the real error.
 async function withPage(name, viewport, fn) {
-  const page = await browser.newPage();
+  const page = await openContractPage();
   await page.setViewport({ ...viewport, deviceScaleFactor: 1 });
   try {
     return await fn(page);
@@ -2406,7 +2435,7 @@ async function inspectNavigationContracts(routes) {
 }
 
 async function inspectResponsiveRoutes(routes) {
-  const page = await browser.newPage();
+  const page = await openContractPage();
   try {
     return await withRetry(() => inspectRoutes(page, routes), "inspectRoutes");
   } catch (error) {

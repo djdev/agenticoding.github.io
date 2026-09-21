@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Fast gate (no browser-contract suite — that stays on deploy); bounded so
     # a hang fails fast instead of sitting out the platform default.
     timeout-minutes: 15
@@ -23,10 +23,10 @@ jobs:
         working-directory: ./website
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm

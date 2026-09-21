@@ -14,25 +14,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
+          - platform: macos-15
             args: --target aarch64-apple-darwin
             rust_target: aarch64-apple-darwin
-          - platform: macos-latest
+          - platform: macos-15
             args: --target x86_64-apple-darwin
             rust_target: x86_64-apple-darwin
           - platform: ubuntu-22.04
             args: ''
             rust_target: ''
-          - platform: windows-latest
+          - platform: windows-2025
             args: ''
             rust_target: ''
 
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -41,11 +41,14 @@ jobs:
       - working-directory: ./website
         run: npm ci
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Ref-as-toolchain action: pinning the SHA requires naming the toolchain
+      # explicitly, or the action reads the SHA as a toolchain name.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
+          toolchain: stable
           targets: ${{ matrix.rust_target }}
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
 

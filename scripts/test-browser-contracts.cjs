@@ -83,6 +83,11 @@ function fail(message) {
   throw new Error(message);
 }
 
+// The route under test, for failure messages; test doubles may omit url().
+function pageRoute(page) {
+  return typeof page.url === "function" ? page.url() : "the page";
+}
+
 // Bounded wait: teardown must never hang the CI step on a process that won't die.
 function withTimeout(promise, ms, label) {
   let timer;
@@ -119,11 +124,9 @@ async function emulateReducedMotion(page) {
 }
 
 // The built site ships third-party requests the contracts don't depend on (umami
-// analytics, the homepage's live api.github.com star refresh, remote doc images). One
-// that stalls without ever receiving response headers keeps Puppeteer's inflight
-// counter above zero, so waitForNetworkIdle() could only time out. Abort every
-// non-local request so the wait observes only the local static server, whose
-// responses always arrive.
+// analytics, the homepage's live api.github.com star refresh, remote doc images).
+// Aborting them keeps every contract hermetic: no dependency on a third party's
+// latency or availability, and no cross-run variance from an external outage.
 async function blockForeignRequests(page) {
   await page.setRequestInterception(true);
   page.on("request", (request) => {
@@ -485,31 +488,32 @@ async function inspectNoJavaScriptStars(html) {
 const SIDEBAR_NAV = "nav.menu";
 const DRAWER_MENU = ".navbar-sidebar__item.menu";
 const SIDEBAR_CATEGORIES = (scope) => `${scope} a[role="button"]`;
+// Docusaurus hydration marker (HasHydratedDataAttribute, Docusaurus #9256;
+// verified against @docusaurus/core 3.9.2). A rename in a future upgrade breaks
+// every contract at once, so the attribute name lives here rather than inline
+// in the page function below. Worst-case wait: 15s hydration + 5s TOC settle
+// inside openChapter, per route attempt — bounded by the deploy step timeout.
+const HYDRATED_ATTR = "data-has-hydrated";
 
 async function waitForHydrated(page) {
-  // Hydration signal: category links keep the SSR fallback href until
-  // useCategoryHrefWithSSRFallback (DocSidebarItem/Category/index.tsx)
-  // re-renders client-side to "#". Clicking before that NAVIGATES instead of
-  // expanding the group — the race these suites hit on slow CI runners, so
-  // this wait is event-driven rather than time-based.
-  const desktopReady = await page
-    .waitForFunction(
-      () =>
-        [...document.querySelectorAll(`${SIDEBAR_NAV} a[role="button"]`)].some(
-          (link) => link.getAttribute("href") === "#",
-        ),
-      // Interval, not the default 'raf': rAF is frame-bound and can pause under
-      // renderer throttling; this probe is the one whose timeout selects the
-      // network-idle fallback, so it's worth being immune to that. 100ms sits well
-      // inside the 5s budget.
-      { timeout: 5000, polling: 100 },
-    )
-    .then(() => true)
-    .catch(() => false);
-  if (desktopReady) return;
-  // Mobile viewport renders no desktop sidebar; network idle is reached only
-  // after the shell scripts that hydrate React have executed.
-  await page.waitForNetworkIdle({ idleTime: 500, timeout: 15000 });
+  // Docusaurus renders <html data-has-hydrated="false"> server-side and flips it
+  // to "true" once React hydrates. That single marker exists at every viewport,
+  // so it replaces the desktop-only category-href probe and the page-global
+  // network-idle fallback whose counter never settled while analytics or media
+  // requests were in flight.
+  try {
+    await page.waitForFunction(
+      (attr) =>
+        document.documentElement.getAttribute(attr) === "true",
+      // Interval polling is immune to renderer rAF throttling on loaded runners.
+      { timeout: 15000, polling: 100 },
+      HYDRATED_ATTR,
+    );
+  } catch (error) {
+    fail(
+      `the page never hydrated (${HYDRATED_ATTR} stayed false) at ${pageRoute(page)}: ${error.message}`,
+    );
+  }
 }
 
 async function waitForCategoryState(
@@ -1020,6 +1024,42 @@ async function openChapter(page, route) {
   await page.goto(siteUrl(route), { waitUntil: "domcontentloaded" });
   await waitForPaint(page);
   await waitForHydrated(page);
+  // Only chapter routes (TOC/audio contracts) need the settle wait: sidebar and
+  // drawer contracts never read the contents list and already synchronize via
+  // waitForCategoryState / waitForActiveChapterInScroller, so adding it there
+  // would only add cost and a new failure mode.
+  await waitForTocSettled(page);
+}
+
+// Hydration flips before the sidebar's scrollspy has published the active row and
+// its highlight finishes transitioning, so the contents list is not comparable yet.
+// Wait until a row draws the rail marker AND the signature stops changing; pages
+// with no contents list have nothing to wait for. Fail-hard after the deadline is
+// deliberate: a chapter page whose scrollspy never publishes an active row is a
+// broken contents list, not timing variance — and a soft pass would read as green.
+async function waitForTocSettled(page) {
+  const deadline = Date.now() + 5000;
+  let previous = null;
+  for (;;) {
+    // Bound the read by the remaining budget so a stuck page.evaluate cannot
+    // overshoot the deadline it is meant to enforce.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const toc = await withTimeout(
+      readTocSignature(page),
+      remaining,
+      `readTocSignature at ${pageRoute(page)}`,
+    );
+    if (!toc) return;
+    if (
+      toc.marker !== "none" &&
+      JSON.stringify(toc) === JSON.stringify(previous)
+    )
+      return;
+    previous = toc;
+    await pause(150);
+  }
+  fail(`the contents list at ${pageRoute(page)} never settled after hydration`);
 }
 
 async function readBandGeometry(page) {

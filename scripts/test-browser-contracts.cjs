@@ -83,6 +83,21 @@ function fail(message) {
   throw new Error(message);
 }
 
+// Actions job-summary telemetry: retry-only passes and the slowest route/viewport
+// checks, so a flake is visible at a glance instead of buried in the log. Absent
+// GITHUB_STEP_SUMMARY (local runs) this is silently unused.
+const telemetry = { contracts: [], routes: [] };
+
+// One contract attempt outcome, flattened for the job summary.
+function recordContract(label, attempts, startedAt, failed) {
+  telemetry.contracts.push({
+    label,
+    attempts,
+    ms: Date.now() - startedAt,
+    failed,
+  });
+}
+
 // The route under test, for failure messages; test doubles may omit url().
 function pageRoute(page) {
   return typeof page.url === "function" ? page.url() : "the page";
@@ -169,10 +184,13 @@ async function withPage(name, viewport, fn) {
 // Lightweight retry for Puppeteer flake (transient nav / animation races).
 // Keeps CI signal: quarantine is via retry, not skip; final failure still throws.
 async function withRetry(fn, label, attempts = 2) {
+  const startedAt = Date.now();
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await fn();
+      const value = await fn();
+      recordContract(label, attempt, startedAt, false);
+      return value;
     } catch (error) {
       lastError = error;
       if (attempt < attempts) {
@@ -183,6 +201,7 @@ async function withRetry(fn, label, attempts = 2) {
       }
     }
   }
+  recordContract(label, attempts, startedAt, true);
   throw lastError;
 }
 
@@ -411,17 +430,25 @@ function assertVariantState(state, route, width) {
 }
 
 async function inspectRoute(page, route, width) {
-  await page.setViewport({ width, height: 900, deviceScaleFactor: 1 });
-  const response = await page.goto(`http://127.0.0.1:${server._port}${route}`, {
-    waitUntil: "domcontentloaded",
-  });
-  if (!response || response.status() >= 400) {
-    fail(`${route} at ${width}px returned ${response && response.status()}`);
+  const startedAt = Date.now();
+  try {
+    await page.setViewport({ width, height: 900, deviceScaleFactor: 1 });
+    const response = await page.goto(
+      `http://127.0.0.1:${server._port}${route}`,
+      {
+        waitUntil: "domcontentloaded",
+      },
+    );
+    if (!response || response.status() >= 400) {
+      fail(`${route} at ${width}px returned ${response && response.status()}`);
+    }
+    await waitForPaint(page);
+    const states = await page.evaluate(variantState);
+    states.forEach((state) => assertVariantState(state, route, width));
+    return states.length;
+  } finally {
+    telemetry.routes.push({ route, width, ms: Date.now() - startedAt });
   }
-  await waitForPaint(page);
-  const states = await page.evaluate(variantState);
-  states.forEach((state) => assertVariantState(state, route, width));
-  return states.length;
 }
 
 async function inspectRoutes(page, routes) {
@@ -2507,7 +2534,83 @@ async function main() {
   );
 }
 
+function retriedContracts() {
+  return telemetry.contracts.filter((entry) => entry.attempts > 1);
+}
+
+// A retried route sweep records each route once per attempt (inspectRoute's
+// finally); collapse to the slowest per route/width so the table names each
+// check once. The map size is also the true unique route/viewport count.
+function slowestRouteChecks() {
+  const slowest = new Map();
+  for (const entry of telemetry.routes) {
+    const key = `${entry.route} ${entry.width}`;
+    if (!slowest.has(key) || entry.ms > slowest.get(key).ms)
+      slowest.set(key, entry);
+  }
+  return slowest;
+}
+
+function retrySection(retried) {
+  const lines = [
+    "",
+    "| contract | attempts | time | outcome |",
+    "| --- | --- | --- | --- |",
+  ];
+  for (const entry of retried) {
+    // Labels are string literals today, but a future `|` would break the
+    // table — escape defensively.
+    const label = entry.label.replaceAll("|", "\\|");
+    lines.push(
+      `| ${label} | ${entry.attempts} | ${(entry.ms / 1000).toFixed(1)}s | ${entry.failed ? "failed" : "passed on retry"} |`,
+    );
+  }
+  // Contract time includes the 400ms x attempt retry backoff sleep.
+  return [...lines, "", "*contract time includes retry backoff waits.*"];
+}
+
+function slowestSection(slowest) {
+  const lines = [
+    "",
+    "### Slowest route/viewport checks",
+    "",
+    "| route | width | time |",
+    "| --- | --- | --- |",
+  ];
+  for (const entry of slowest) {
+    lines.push(`| ${entry.route} | ${entry.width} | ${entry.ms}ms |`);
+  }
+  return lines;
+}
+
+// Emits the flake signal to the Actions job summary. A missing target (local run)
+// or a write error must never mask the test result, so it is best-effort.
+function writeStepSummary() {
+  const target = process.env.GITHUB_STEP_SUMMARY;
+  if (!target) return;
+  try {
+    const retried = retriedContracts();
+    const slowestByRoute = slowestRouteChecks();
+    const slowest = [...slowestByRoute.values()]
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, 10);
+    const lines = [
+      "## Browser contracts",
+      "",
+      `- result: ${process.exitCode ? "failed" : "passed"}`,
+      `- route/viewport checks: ${slowestByRoute.size}`,
+      `- contracts retried: ${retried.length}`,
+    ];
+    if (retried.length) lines.push(...retrySection(retried));
+    if (slowest.length) lines.push(...slowestSection(slowest));
+    fs.appendFileSync(target, `${lines.join("\n")}\n`);
+  } catch (error) {
+    console.warn(`[summary] ${error.message}`);
+  }
+}
+
 async function cleanup() {
+  writeStepSummary();
   if (browser) {
     try {
       await withTimeout(browser.close(), 5000, "browser.close()");
@@ -2528,9 +2631,21 @@ async function cleanup() {
   process.exit(process.exitCode ?? 0);
 }
 
-main()
-  .catch((error) => {
-    console.error(error.stack || error);
-    process.exitCode = 1;
-  })
-  .finally(cleanup);
+// Required by harness tests: only launch the suite when executed directly.
+if (require.main === module) {
+  main()
+    .catch((error) => {
+      console.error(error.stack || error);
+      process.exitCode = 1;
+    })
+    .finally(cleanup);
+}
+
+// Test-only surface: harnesses stub page/fs/env and drive these units directly.
+module.exports = {
+  withRetry,
+  waitForHydrated,
+  waitForTocSettled,
+  writeStepSummary,
+  telemetry,
+};

@@ -1,0 +1,12 @@
+# Keep the SHA-pinned Actions current: Dependabot rewrites the pinned commit and
+# its trailing version comment together, so updates stay reviewable.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"

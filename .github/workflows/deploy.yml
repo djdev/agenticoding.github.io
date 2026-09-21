@@ -19,7 +19,9 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     # Healthy runtime ~9min; bounded so a hang fails fast instead of sitting
-    # out the 360min platform default.
+    # out the 360min platform default. No Puppeteer browser cache by design:
+    # a stale Chrome-for-Testing caused flakes, so every build downloads it
+    # fresh (slower green builds, deterministic browser).
     timeout-minutes: 25
     defaults:
       run:
@@ -36,13 +38,6 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: ./website/package-lock.json
-
-      - name: Cache Puppeteer Chromium
-        uses: actions/cache@v4
-        with:
-          # Keyed on the lockfile so a puppeteer version bump invalidates it.
-          path: ~/.cache/puppeteer
-          key: puppeteer-${{ runner.os }}-${{ hashFiles('website/package-lock.json') }}
 
       - name: Install dependencies
         run: npm ci
